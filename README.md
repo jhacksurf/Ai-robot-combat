@@ -1,117 +1,138 @@
-# AI Battle Bot – Sensing & Network I/O Spec
+# AI Battle Bot – Updated Sensor & Network I/O Spec
 
-This doc captures the current design so we don’t lose it.
-
----
-
-## 1. Overall Approach
-
-- MCU: Raspberry Pi Pico 2
-- No explicit “history” in the inputs (no prev/delta).
-- **Many sensors + orientation + RC + internal memory**.
-- Neural network has:
-  - Normal outputs for motion.
-  - Extra “scratch” outputs that are fed back as inputs next tick = **learned memory**.
-- Model trained in simulation first, then refined with real fight logs.
+This is the **latest version** of the design based on your last message.
 
 ---
 
-## 2. Sensors & Signals (Per Timestep)
+## 1. MCU & High-Level Design
 
-### 2.1 Time-of-Flight (ToF) Distance Sensors
+- MCU: **Raspberry Pi Pico 2**
+- Storage: Internal flash (and later SD if needed).
+- **No explicit history** in inputs.
+- **Memory is entirely via scratch channels** (network-controlled state).
+- Model is trained in simulation first, then refined with real fight logs.
 
-**A. Horizontal ToFs (walls / bots / compactor)**  
-Exact count & layout can be tuned, but conceptually:
+---
 
-- Front arc: e.g. 5 sensors
+## 2. Sensors (Per Timestep)
+
+### 2.1 Horizontal ToF Distance Sensors (Walls / Bots / Compactor)
+
+**Purpose:** See objects around the bot while on wheels **or** flipped.
+
+Layout idea (exact count tweakable):
+
+- **Front** (e.g. 3–5 sensors):
   - `tof_front_left`
-  - `tof_front_mid_left`
   - `tof_front_center`
-  - `tof_front_mid_right`
   - `tof_front_right`
-- Side sensors: e.g. 2 sensors
+  - (optionally `tof_front_mid_left`, `tof_front_mid_right`)
+
+- **Sides** (e.g. 2 sensors):
   - `tof_side_left`
   - `tof_side_right`
-- Rear sensors: e.g. 2 sensors
+
+- **Rear** (e.g. 2 sensors):
   - `tof_rear_left`
-  - `tof_rear_center` / `tof_rear_right`
+  - `tof_rear_right` (or `tof_rear_center`)
 
-All values **normalized** 0..1 (0 = very close, 1 = far / max range).
+All values are **normalized** (0..1):
+- 0 = very close
+- 1 = far / max measurable distance
 
-**B. Ground / Pit ToFs (downward)**
-
-- 4 downward/angled sensors near the front edge:
-  - `tof_ground_fl`
-  - `tof_ground_fr`
-  - `tof_ground_rl`
-  - `tof_ground_rr`
-- Detect normal floor vs pit (sudden “no floor” distance).
-
-Values normalized similarly; policy also sees orientation flags so it can learn when these are unreliable (e.g. upside down).
+The exact number and names can be finalized when you know how many ToFs you physically mount, but the network expects:
+- A block of “horizontal ToFs” that cover front, sides, rear.
 
 ---
 
-### 2.2 Mouse / Optical Motion Sensor
+### 2.2 Ground / Pit ToF Sensors
 
-Converted into velocities in robot frame:
+**Purpose:** Detect floor vs pit, both upright and upside-down.
 
-- `v_forward`   – forward/backwards speed estimate
-- `v_sideways`  – lateral slip
+Total: **6 ground/pit-oriented ToFs**:
 
-Values normalized to a reasonable range (e.g. -1..1).
+- **4 downward / angled near the base** (for normal upright pit detection):
+  - `tof_ground_fl_down`
+  - `tof_ground_fr_down`
+  - `tof_ground_rl_down`
+  - `tof_ground_rr_down`
 
----
+- **2 angled “upwards” / opposite direction** (useful when upside down or tilted):
+  - `tof_ground_front_up`
+  - `tof_ground_rear_up`
 
-### 2.3 IMU (Accel + Gyro) & Orientation
+All normalized 0..1 as distances.
 
-Raw-ish IMU:
-
-- `accel_x`
-- `accel_y`
-- `accel_z`
-- `gyro_z` (yaw rate)
-
-Plus **orientation flags** derived from accel (gravity direction):
-
-- `is_upright`      (0 or 1)
-- `is_on_side`      (0 or 1)
-- `is_upside_down`  (0 or 1)
-
-Only one of these should be 1 at a time under normal conditions.
+> The network will see all 6 values every tick.  
+> IMU orientation lets it learn when the “down” ones are trustworthy and when the “up” ones become useful (e.g. upside down).
 
 ---
 
-### 2.4 RC Inputs
+### 2.3 Mouse / Motion Sensor
 
-To mix human control and AI:
+**Purpose:** Estimate robot motion along floor, detect slip.
 
-- `rc_throttle`   (stick forward/back, normalized -1..1)
-- `rc_turn`       (stick left/right, -1..1)
-- `rc_ai_enable`  (0 or 1)
-- `rc_mode`       (0..1 or -1..1; extra 3-pos switch like safe/normal/aggressive)
+Per timestep, convert raw optical Δx, Δy to robot-frame velocities:
 
----
+- `v_forward`   – forward/backward speed (normalized -1..1)
+- `v_sideways`  – lateral slip speed (normalized -1..1)
 
-### 2.5 Pit Memory (Optional Hard-Coded Memory)
-
-The firmware can maintain an estimate of pit direction when seen:
-
-- `pit_known`  (0 or 1, or a decaying confidence 0..1)
-- `pit_vec_x`  (cos of pit direction from robot)
-- `pit_vec_y`  (sin of pit direction from robot)
-
-These are updated whenever pit sensors + orientation indicate the pit has been detected.
+No manual history; the network will use scratch memory to track anything longer-term it cares about.
 
 ---
 
-### 2.6 Scratch Memory (Learned State)
+### 2.4 IMU – Full Raw Inputs
 
-The network is given N “scratch” memory channels:
+You want **full raw IMU**, so we include all accel + gyro axes:
 
-- **Inputs**: `scratch_in[0..N-1]`
-- **Outputs**: `scratch_out[0..N-1]`
+- Accelerometer:
+  - `accel_x`
+  - `accel_y`
+  - `accel_z`
 
-Firmware wiring:
+- Gyroscope:
+  - `gyro_x`
+  - `gyro_y`
+  - `gyro_z`
+
+From these, the network can infer:
+- Upright vs upside-down vs on side (via gravity direction).
+- Spin rate, impacts, etc.
+
+> No separate orientation flags are strictly required now, because the model sees full accel/gyro and can decode orientation itself.
+
+---
+
+### 2.5 RC Inputs (Mode Signals for the Model)
+
+Instead of feeding sticks, the model just gets **mode/state info** from RC / game state:
+
+- `rc_test_check`  – “test/check” mode
+- `rc_get_ready`   – “get ready” mode
+- `rc_go`          – “fight/go” mode
+
+You can feed these as **three separate inputs**, typically one-hot encoded:
+- Example:
+  - Test/check: 1,0,0
+  - Get ready:  0,1,0
+  - Go:         0,0,1
+
+If you decide to add an “idle” or “disabled” state later, you can add a fourth mode input.
+
+These tell the network *where in the match flow* you are (e.g. testing sensors vs actually fighting).
+
+---
+
+### 2.6 Scratch Memory (Network-Controlled State)
+
+All “Pi memory” / internal state is via **scratch channels**.
+
+- Inputs:
+  - `scratch_in[0..N-1]`  (from previous timestep)
+- Outputs:
+  - `scratch_out[0..N-1]` (network’s new memory state)
+
+On the firmware side:
 
 ```text
 scratch_in(t) = scratch_out(t-1)
